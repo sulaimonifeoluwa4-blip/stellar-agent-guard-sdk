@@ -37,7 +37,7 @@ Enforcement happens **inside the account itself**, via Soroban's native Custom A
 
 ## What it does
 
-- **Pre-flight policy interception (`PreFlightInterceptor`)**: Intercepts contract calls before broadcast, simulates auth authorization, and returns a discriminated `admissible`, `blocked`, or `undetermined` verdict. Never throws on policy refusal.
+- **Pre-flight policy interception (`PreFlightInterceptor`)**: Intercepts contract calls before broadcast, simulates auth authorization, and returns a discriminated `admissible`, `blocked`, or `undetermined` verdict. Never throws on policy refusal. An opt-in short-lived cache can reduce repeated simulation RPC calls within the current ledger; a cached verdict can be staler than one admitted transfer.
 - **In-process cost pre-checking (`CostPreChecker`)**: Prices transaction execution from simulation results, reporting resource fees, inclusion fees, and total fees against an optional ceiling.
 - **Autonomous transaction execution (`invoke()`)**: Executes the full Soroban lifecycle: probe simulation, auth signing for custom accounts, enforced simulation, and broadcast with bounded retry for stale ledger resource limits (`scecExceededLimit`).
 - **Framework adapters**:
@@ -90,6 +90,32 @@ if (decision.kind === "admissible") {
   console.log("Undetermined (fails closed)");
 }
 ```
+
+### Optional simulation-result cache
+
+Pre-flight checks are opt-in cached when a short TTL is supplied. The cache is
+bounded to the current ledger (and never exceeds one five-second ledger-close
+window), and it is cleared when the ledger advances. Use `invalidate()` after an
+operator action that changes policy state. If the policy revision is available
+to the integration, pass it through `policyRevision` so a policy change busts
+cached verdicts immediately:
+
+```ts
+const interceptor = new PreFlightInterceptor({
+  // server, networkPassphrase, guard, agent, source ...
+  cache: {
+    ttlLedgers: 1,
+    policyRevision: () => readPolicyRevision(),
+  },
+});
+
+interceptor.invalidate();
+```
+
+Caching is disabled by default. A **cached verdict can be staler than one
+admitted transfer**: the rolling spend window may move after a simulation while
+the cached result is still being reused. Use a shorter TTL or explicit
+invalidation when that staleness is unacceptable.
 
 ### Framework Middleware (LangChain & ElizaOS)
 
