@@ -24,6 +24,7 @@
  * A refused call never has a transaction hash. That is not a gap in the
  * evidence: the block happens before broadcast, which is what makes it free.
  */
+import { createHash } from "node:crypto";
 import { Keypair, rpc } from "@stellar/stellar-sdk";
 import { enforceCall } from "./invoke.ts";
 import { GuardBlockedError, explainReason } from "./reasons.ts";
@@ -71,6 +72,20 @@ export type PreFlightDecision =
       detail: string;
     };
 
+export type PolicyRevision = string | number | bigint | boolean | null | undefined;
+
+export interface PreFlightCacheOptions {
+  /** Maximum age of a cached verdict; capped at one ledger close window. */
+  ttlMs?: number;
+  /** Ledger-based spelling of `ttlMs`; one ledger is approximately five seconds. */
+  ttlLedgers?: number;
+  /**
+   * Optional policy revision, or a getter for it. Supplying this makes policy
+   * changes invalidate the cache before the next ledger boundary.
+   */
+  policyRevision?: PolicyRevision | (() => PolicyRevision | Promise<PolicyRevision>);
+}
+
 export interface PreFlightConfig {
   server: rpc.Server;
   networkPassphrase: string;
@@ -82,13 +97,119 @@ export interface PreFlightConfig {
   source: Keypair;
   /** Authorizers for non-guard requirements (e.g. an admin on a policy call). */
   accountSigners?: Keypair[];
+  /** Opt-in short-lived simulation-result cache. Caching is disabled by default. */
+  cache?: PreFlightCacheOptions;
+}
+
+export type PreFlightInterceptorOptions = PreFlightConfig;
+
+const LEDGER_CLOSE_MS = 5_000;
+const MAX_CACHE_TTL_MS = LEDGER_CLOSE_MS;
+
+interface CacheEntry {
+  decision: PreFlightDecision;
+  ledger: number;
+  expiresAt: number;
+}
+
+interface CacheContext {
+  key: string;
+  ledger: number;
+  expiresAt: number;
+}
+
+function policyRevisionToken(revision: PolicyRevision): string {
+  if (revision === undefined) return "unknown";
+  if (revision === null) return "null";
+  return `${typeof revision}:${String(revision)}`;
+}
+
+function callFingerprint(call: ContractCall): string {
+  const args = createHash("sha256");
+  for (const arg of call.args) {
+    args.update(Buffer.from(arg.toXDR()));
+    args.update(Buffer.from([0]));
+  }
+  return createHash("sha256")
+    .update(call.contract)
+    .update(Buffer.from([0]))
+    .update(call.fn)
+    .update(Buffer.from([0]))
+    .update(args.digest())
+    .digest("hex");
 }
 
 export class PreFlightInterceptor {
   private readonly config: PreFlightConfig;
+  private readonly cacheOptions: PreFlightCacheOptions | undefined;
+  private readonly cache = new Map<string, CacheEntry>();
 
   constructor(config: PreFlightConfig) {
     this.config = config;
+    this.cacheOptions = config.cache;
+    this.validateCacheOptions();
+  }
+
+  private validateCacheOptions(): void {
+    if (!this.cacheOptions) return;
+    const { ttlMs, ttlLedgers } = this.cacheOptions;
+    if (ttlMs === undefined && ttlLedgers === undefined) {
+      throw new TypeError("preflight cache requires ttlMs or ttlLedgers");
+    }
+    if (ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs <= 0)) {
+      throw new TypeError("preflight cache ttlMs must be a positive finite number");
+    }
+    if (ttlLedgers !== undefined && (!Number.isFinite(ttlLedgers) || ttlLedgers <= 0)) {
+      throw new TypeError("preflight cache ttlLedgers must be a positive finite number");
+    }
+  }
+
+  private cacheTtlMs(): number {
+    const { ttlMs, ttlLedgers } = this.cacheOptions ?? {};
+    const requested = ttlMs ?? (ttlLedgers ?? 0) * LEDGER_CLOSE_MS;
+    return Math.min(requested, MAX_CACHE_TTL_MS);
+  }
+
+  private async cacheContext(call: ContractCall): Promise<CacheContext | null> {
+    if (!this.cacheOptions) return null;
+
+    let revision: PolicyRevision;
+    try {
+      revision =
+        typeof this.cacheOptions.policyRevision === "function"
+          ? await this.cacheOptions.policyRevision()
+          : this.cacheOptions.policyRevision;
+    } catch {
+      // A revision read failure must not turn a cache miss into a failed
+      // security decision. The uncached path below will report the real result.
+      return null;
+    }
+
+    let ledger: number;
+    try {
+      const latest = await this.config.server.getLatestLedger();
+      ledger = latest.sequence;
+    } catch {
+      return null;
+    }
+
+    return {
+      key: `${callFingerprint(call)}:${policyRevisionToken(revision)}`,
+      ledger,
+      expiresAt: Date.now() + this.cacheTtlMs(),
+    };
+  }
+
+  /** Clear all cached verdicts, or only entries for `call` when provided. */
+  invalidate(call?: ContractCall): void {
+    if (!call) {
+      this.cache.clear();
+      return;
+    }
+    const prefix = `${callFingerprint(call)}:`;
+    for (const key of this.cache.keys()) {
+      if (key.startsWith(prefix)) this.cache.delete(key);
+    }
   }
 
   /**
@@ -96,6 +217,14 @@ export class PreFlightInterceptor {
    * throws for a refusal — a block is a normal, expected result.
    */
   async check(call: ContractCall): Promise<PreFlightDecision> {
+    const context = await this.cacheContext(call);
+    if (context) {
+      const cached = this.cache.get(context.key);
+      if (cached && cached.ledger === context.ledger && cached.expiresAt > Date.now()) {
+        return cached.decision;
+      }
+    }
+
     const outcome = await enforceCall({
       server: this.config.server,
       source: this.config.source,
@@ -105,11 +234,11 @@ export class PreFlightInterceptor {
       ...(this.config.accountSigners ? { accountSigners: this.config.accountSigners } : {}),
     });
 
+    let decision: PreFlightDecision;
     if (outcome.kind === "error") {
-      return { allowed: false, kind: "undetermined", detail: outcome.detail };
-    }
-    if (outcome.kind === "blocked") {
-      return {
+      decision = { allowed: false, kind: "undetermined", detail: outcome.detail };
+    } else if (outcome.kind === "blocked") {
+      decision = {
         allowed: false,
         kind: "blocked",
         reason: outcome.reason,
@@ -117,20 +246,26 @@ export class PreFlightInterceptor {
         detail: outcome.detail,
         diagnosticEvents: outcome.diagnosticEvents,
       };
+    } else {
+      const data = outcome.simulation.transactionData as unknown as
+        | { getReadOnly?: () => unknown[]; getReadWrite?: () => unknown[] }
+        | undefined;
+      const footprintKeys =
+        (data?.getReadOnly?.().length ?? 0) + (data?.getReadWrite?.().length ?? 0);
+      decision = {
+        allowed: true,
+        kind: "admissible",
+        estimatedResourceFee: BigInt(outcome.simulation.minResourceFee ?? 0),
+        footprintKeys,
+      };
     }
 
-    const data = outcome.simulation.transactionData as unknown as
-      | { getReadOnly?: () => unknown[]; getReadWrite?: () => unknown[] }
-      | undefined;
-    const footprintKeys =
-      (data?.getReadOnly?.().length ?? 0) + (data?.getReadWrite?.().length ?? 0);
-
-    return {
-      allowed: true,
-      kind: "admissible",
-      estimatedResourceFee: BigInt(outcome.simulation.minResourceFee ?? 0),
-      footprintKeys,
-    };
+    // An undetermined result is not a verdict and may be transient, so it is
+    // deliberately not cached. Actual admissible/blocked results are.
+    if (context && decision.kind !== "undetermined") {
+      this.cache.set(context.key, { decision, ledger: context.ledger, expiresAt: context.expiresAt });
+    }
+    return decision;
   }
 
   /**
